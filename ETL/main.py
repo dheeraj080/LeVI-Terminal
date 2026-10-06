@@ -2,7 +2,9 @@ import os
 import logging
 import requests
 import pandas as pd
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, quote_plus
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
 from dotenv import load_dotenv
 
 # --- LOGGING SETUP ---
@@ -17,15 +19,59 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 API_URL = os.getenv("EXCHANGE_KEY", "").strip()
-DB_URL = os.getenv("SUPABASE_URL", "").strip()
+RAW_DB_URL = os.getenv("SUPABASE_URL", "").strip()
 
-if not API_URL or not DB_URL:
+if not API_URL or not RAW_DB_URL:
     logger.error("Missing environment variables: EXCHANGE_KEY or SUPABASE_URL")
     exit(1)
 
-# Ensure SSL for Supabase
-if "sslmode" not in DB_URL:
-    DB_URL += ("&" if "?" in DB_URL else "?") + "sslmode=require"
+
+def normalize_db_url(url_str: str) -> str:
+    """Ensures dialect compatibility, URL-encodes passwords, and safely appends sslmode."""
+    # Fix scheme prefix for SQLAlchemy
+    if url_str.startswith("postgres://"):
+        url_str = url_str.replace("postgres://", "postgresql://", 1)
+
+    try:
+        # Parse the connection components
+        parsed = urlparse(url_str)
+        
+        # Safely URL-encode the password if present
+        username = parsed.username or ""
+        password = quote_plus(parsed.password) if parsed.password else ""
+        user_info = f"{username}:{password}" if password else username
+        
+        # Reconstruct network location (host + port)
+        netloc = f"{user_info}@{parsed.hostname}"
+        if parsed.port:
+            netloc += f":{parsed.port}"
+
+        # Ensure sslmode=require is present in query parameters
+        query_params = parse_qs(parsed.query)
+        if "sslmode" not in query_params:
+            query_params["sslmode"] = ["require"]
+        
+        new_query = urlencode(query_params, doseq=True)
+
+        normalized_url = urlunparse((
+            parsed.scheme,
+            netloc,
+            parsed.path,
+            parsed.params,
+            new_query,
+            parsed.fragment
+        ))
+
+        # Validate with SQLAlchemy's URL parser before returning
+        make_url(normalized_url)
+        return normalized_url
+
+    except Exception as err:
+        logger.error(f"Failed to parse database URL: {err}")
+        exit(1)
+
+
+DB_URL = normalize_db_url(RAW_DB_URL)
 
 # Optimized engine for Cloud/Serverless environments
 engine = create_engine(
@@ -56,7 +102,6 @@ def capture_historical_rates():
         return
 
     # 2. Transformation
-    # Convert to DataFrame and cast types explicitly
     df = pd.DataFrame(list(rates_dict.items()), columns=["currency_code", "rate"])
     df["recorded_at"] = pd.to_datetime(api_time)
     df["rate"] = pd.to_numeric(df["rate"])
@@ -64,7 +109,6 @@ def capture_historical_rates():
     # 3. Load into PostgreSQL with Idempotency Check
     try:
         with engine.begin() as conn:
-            # OPTIONAL: Check if data for this timestamp already exists to avoid duplicates
             check_sql = text(
                 "SELECT EXISTS(SELECT 1 FROM exchange_rates WHERE recorded_at = :t LIMIT 1)"
             )
